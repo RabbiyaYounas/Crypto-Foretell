@@ -1,0 +1,1277 @@
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import Dataset, DataLoader
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import math
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from torchsummary import summary
+
+torch.manual_seed(42)
+np.random.seed(42)
+from torchviz import make_dot
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, seq_length, pred_length):
+        self.data = data
+        self.seq_length = seq_length
+        self.pred_length = pred_length
+        
+    def __len__(self):
+        return len(self.data) - self.seq_length - self.pred_length + 1
+    
+    def __getitem__(self, idx):
+        
+        x = self.data[idx:idx+self.seq_length]
+       
+        y = self.data[idx+self.seq_length:idx+self.seq_length+self.pred_length]
+        
+        
+        decoder_input = torch.zeros_like(y)
+        if self.seq_length > 0:
+            decoder_input[0] = x[-1]
+        decoder_input[1:] = y[:-1]
+        
+        return x, decoder_input, y
+
+
+def load_crypto_data(file_path):
+   
+    df = pd.read_csv(file_path)
+    
+    
+    actual_columns = {}
+    for standard_name, possible_names in {
+        'date': ['date', 'calendar_todaydatesort', 'Date'],
+        'open': ['open', 'grid_3x3opensort', 'Open'],
+        'high': ['high', 'grid_3x3highsort', 'High'],
+        'low': ['low', 'grid_3x3lowsort', 'Low'],
+        'close': ['close', 'grid_3x3closesort', 'Close']
+    }.items():
+        for col in possible_names:
+            if col in df.columns:
+                actual_columns[standard_name] = col
+                break
+    
+    
+    df = df[[actual_columns[col] for col in ['date', 'open', 'high', 'low', 'close']]]
+    df.columns = ['date', 'open', 'high', 'low', 'close']
+    
+    
+    df['date'] = pd.to_datetime(df['date'])
+
+    # Filter for data after January 1, 2017
+    df = df[df['date'] >= pd.to_datetime('2017-01-01')]
+
+    
+    df = df.sort_values('date')
+    
+    
+    df = df.reset_index(drop=True)
+    
+    return df
+
+
+def prepare_features(df):
+
+    df['ma7'] = df['close'].rolling(window=7).mean()
+    df['ma14'] = df['close'].rolling(window=14).mean()
+    df['ma30'] = df['close'].rolling(window=30).mean()
+    
+    
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+    
+ 
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+    
+ 
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + 2 * df['bb_std']
+    df['bb_lower'] = df['bb_middle'] - 2 * df['bb_std']
+    
+    df['price_change'] = df['close'].pct_change()
+    
+
+    df['volatility'] = df['close'].rolling(window=14).std()
+    
+
+    df['hl_range'] = (df['high'] - df['low']) / df['close']
+
+    df = df.dropna()
+    
+    return df
+
+def prepare_data(df, seq_length, pred_length, target_col='close', batch_size=32):
+    feature_columns = ['open', 'high', 'low', 'close', 
+                       'ma7', 'ma14', 'ma30', 'rsi', 
+                       'ema12', 'ema26', 'macd', 'macd_signal', 'macd_hist',
+                       'bb_middle', 'bb_std', 'bb_upper', 'bb_lower',
+                       'price_change', 'volatility', 'hl_range']
+    
+    print(f"Using features: {feature_columns}")
+    print(f"Number of features: {len(feature_columns)}")
+
+    scaler = MinMaxScaler()
+    data_scaled = scaler.fit_transform(df[feature_columns])
+    
+
+    data_tensor = torch.FloatTensor(data_scaled)
+    
+    # Split data into train, validation, and test sets
+    train_size = int(0.7 * len(data_tensor))
+    val_size = int(0.15 * len(data_tensor))
+    test_size = len(data_tensor) - train_size - val_size
+    
+    train_data = data_tensor[:train_size]
+    val_data = data_tensor[train_size:train_size+val_size]
+    test_data = data_tensor[train_size+val_size:]
+    
+
+    train_dataset = TimeSeriesDataset(train_data, seq_length, pred_length)
+    val_dataset = TimeSeriesDataset(val_data, seq_length, pred_length)
+    test_dataset = TimeSeriesDataset(test_data, seq_length, pred_length)
+    print(seq_length)
+    print(pred_length)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=batch_size)
+    
+
+    target_idx = feature_columns.index(target_col)
+    target_scaler = MinMaxScaler()
+    target_scaler.fit(df[[target_col]].values)
+    
+    return train_loader, val_loader, test_loader, target_scaler
+
+# Model components
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=5000):
+        super(PositionalEncoding, self).__init__()
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :x.size(1), :]
+
+class SeriesDecomposition(nn.Module):
+    """Series decomposition block"""
+    def __init__(self, kernel_size):
+        super(SeriesDecomposition, self).__init__()
+        self.kernel_size = kernel_size
+
+    def forward(self, x):
+
+        x_transpose = x.transpose(1, 2)
+        
+        # Apply average pooling with explicit padding
+        padding = self.kernel_size // 2
+        trend = F.avg_pool1d(
+            F.pad(x_transpose, pad=(padding, padding), mode='replicate'),
+            kernel_size=self.kernel_size,
+            stride=1
+        )
+        
+        # Transpose back
+        trend = trend.transpose(1, 2)
+        
+        # Calculate seasonal component
+        seasonal = x - trend
+        
+        return trend, seasonal
+
+class AutoCorrelation(nn.Module):
+    """Auto-correlation mechanism for capturing periodic patterns"""
+    def __init__(self, dim, heads=8):
+        super(AutoCorrelation, self).__init__()
+        self.dim = dim
+        self.heads = heads
+        self.head_dim = dim // heads
+        self.scale = self.head_dim ** -0.5
+        
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        
+    def time_delay_agg(self, values, corr):
+
+        batch, head, length, d_k = values.shape
+       
+        expected_size = batch * head * length * length
+        actual_size = corr.numel()
+        
+      
+        if actual_size != expected_size:
+         
+            corr = corr.view(batch, head, length, length)
+        else:
+            
+            corr = corr.reshape(batch * head, length, length)
+        
+        values = values.reshape(batch * head, length, d_k)
+ 
+        output = torch.bmm(corr, values)
+        output = output.reshape(batch, head, length, d_k)
+        return output
+    
+    def forward(self, queries, keys, values, attn_mask=None):
+
+        B, L, _ = queries.shape
+        _, S, _ = keys.shape
+
+        q = self.q_proj(queries).reshape(B, L, self.heads, self.head_dim).transpose(1, 2)  # B, H, L, D
+        k = self.k_proj(keys).reshape(B, S, self.heads, self.head_dim).transpose(1, 2)     # B, H, S, D
+        v = self.v_proj(values).reshape(B, S, self.heads, self.head_dim).transpose(1, 2)   # B, H, S, D
+
+        q_fft = torch.fft.rfft(q, dim=-1)
+        k_fft = torch.fft.rfft(k, dim=-1)
+
+        res = q_fft * torch.conj(k_fft)
+
+        corr = torch.fft.irfft(res, dim=-1)
+
+        if corr.size(-1) != L:
+
+            if corr.size(-1) < L:
+                padding = L - corr.size(-1)
+                corr = F.pad(corr, (0, padding))
+            else:
+                corr = corr[..., :L]
+        
+
+        corr = F.softmax(corr * self.scale, dim=-1)
+  
+        if attn_mask is not None:
+            corr = corr.masked_fill(attn_mask == 0, 0.0)
+        
+        if corr.size(-1) != S:
+          
+            if corr.size(-1) < S:
+                padding = S - corr.size(-1)
+                corr = F.pad(corr, (0, padding, 0, 0))
+            else:
+                corr = corr[..., :S, :]
+        
+     
+        output = self.time_delay_agg(v, corr)
+        
+      
+        output = output.transpose(1, 2).reshape(B, L, self.dim)
+        output = self.out_proj(output)
+        
+        return output
+
+class AutoCorrelationLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super(AutoCorrelationLayer, self).__init__()
+        self.autocorr = AutoCorrelation(d_model, n_heads)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+    def forward(self, x, attn_mask=None):
+        x = x + self.dropout(self.autocorr(self.norm1(x), self.norm1(x), self.norm1(x), attn_mask))
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
+
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super(SelfAttentionLayer, self).__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+    def forward(self, x, attn_mask=None):
+        x_norm = self.norm1(x)
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
+        x = x + self.dropout(attn_output)
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
+
+class CrossAttentionLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super().__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+
+    def forward(self, q, k, v):
+        q_ = self.norm1(q)
+        k_ = self.norm1(k)
+        v_ = self.norm1(v)
+        attn_output, _ = self.attn(q_, k_, v_)
+        out = q + self.dropout(attn_output)
+        out = out + self.dropout(self.ff(self.norm2(out)))
+        return out
+
+
+def run(data, seq_length, pred_length, target_col, device, epochs=5000):
+
+    ablation_configs = {
+        'proposed1': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': True,
+            'use_decomposition': True,
+            'use_autocorr': True,
+            'use_self_attn': True,
+            'use_lstm': True
+        },
+        'Proposed2': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': False,
+            'use_decomposition': True,
+            'use_autocorr': True,
+            'use_self_attn': True,
+            'use_lstm': True
+        },
+        'Proposed3': {
+            'use_long_fore': True,
+            'use_acc_fore': False,
+            'use_ensemble': False,
+            'use_decomposition': True,
+            'use_autocorr': True,
+            'use_self_attn': False,
+            'use_lstm': False
+        },
+        'Proposed4': {
+            'use_long_fore': False,
+            'use_acc_fore': True,
+            'use_ensemble': False,
+            'use_decomposition': False,
+            'use_autocorr': False,
+            'use_self_attn': True,
+            'use_lstm': True
+        },
+        'proposoed5': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': True,
+            'use_decomposition': False,
+            'use_autocorr': True,
+            'use_self_attn': True,
+            'use_lstm': True
+        },
+        'proposed6': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': True,
+            'use_decomposition': True,
+            'use_autocorr': False,
+            'use_self_attn': True,
+            'use_lstm': True
+        },
+        'Proposed7': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': True,
+            'use_decomposition': True,
+            'use_autocorr': True,
+            'use_self_attn': False,
+            'use_lstm': True
+        },
+        'proposed8': {
+            'use_long_fore': True,
+            'use_acc_fore': True,
+            'use_ensemble': True,
+            'use_decomposition': True,
+            'use_autocorr': True,
+            'use_self_attn': True,
+            'use_lstm': False
+        }
+        
+    }
+    
+  
+    results = {}
+    
+
+    train_loader, val_loader, test_loader, scaler = prepare_data(data, seq_length, pred_length, target_col, batch_size=32)
+    
+
+    for config_name, config in ablation_configs.items():
+        print(f"\n{'='*50}")
+        print(f"Running ablation study for: {config_name}")
+        print(f"{'='*50}")
+        
+      
+        model = create_ablation_model(
+            input_size=len(data.columns) - 1, 
+            output_size=1,
+            d_model=128,
+            n_heads=8,
+            num_layers=3,
+            kernel_size=25,
+            hidden_size=64,
+            dropout=0.1,
+            config=config
+        ).to(device)
+
+        def count_parameters(model):
+            return sum(p.numel() for p in model.parameters() if p.requires_grad)
+        
+        print(f"Total Trainable Parameters for {config_name}: {count_parameters(model):,}")
+
+        
+        dummy_x_enc = torch.randn(1, 60, 20).to(device)
+        dummy_x_dec = torch.randn(1, 30, 20).to(device)
+
+        model.eval()
+        dummy_out = model(dummy_x_enc, dummy_x_dec)
+        
+
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
+        
+        train_losses, val_losses = train_model(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            epochs=epochs
+        )
+        
+
+        test_loss, mse, rmse, mae, mape, smape, r2, medae, explained_var, mbe, predictions, actuals = evaluate_model(
+            model=model,
+            test_loader=test_loader,
+            criterion=criterion,
+            device=device,
+            scaler=scaler
+        )
+
+
+        results[config_name] = {
+            'test_loss': test_loss,
+            'mse': mse,
+            'rmse': rmse,
+            'mae': mae,
+            'mape': mape,
+            'smape': smape,
+            'r2': r2,
+            'medae': medae,
+            'explained_variance': explained_var,
+            'mbe': mbe,
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'predictions': predictions,
+            'actuals': actuals
+        }
+
+        
+        
+        torch.save(model.state_dict(), f'model_{config_name}.pth')
+
+    visualize_ablation_results(results)
+    
+    return results
+
+def create_ablation_model(input_size, output_size, d_model, n_heads, num_layers, kernel_size, hidden_size, dropout, config):
+
+    class AblationModel(nn.Module):
+        def __init__(self):
+            super(AblationModel, self).__init__()
+            
+           
+            self.input_embedding = nn.Linear(input_size, d_model)
+            
+          
+            self.use_long_fore = config['use_long_fore']
+            if self.use_long_fore:
+                if config['use_decomposition']:
+                    self.decomp = SeriesDecomposition(kernel_size)
+                else:
+                    self.decomp = None
+                    
+              
+                self.long_encoder_layers = nn.ModuleList([])
+                for _ in range(num_layers):
+                    if config['use_autocorr']:
+                        self.long_encoder_layers.append(AutoCorrelationLayer(d_model, n_heads, dropout))
+                    else:
+                        self.long_encoder_layers.append(SelfAttentionLayer(d_model, n_heads, dropout))
+                
+              
+                self.long_decoder_layers = nn.ModuleList([])
+                for _ in range(num_layers):
+                    layer = nn.ModuleList([])
+                    if config['use_autocorr']:
+                        layer.append(AutoCorrelationLayer(d_model, n_heads, dropout))
+                        layer.append(CrossAttentionLayer(d_model, n_heads, dropout))
+                    else:
+                        layer.append(SelfAttentionLayer(d_model, n_heads, dropout))
+                        layer.append(CrossAttentionLayer(d_model, n_heads, dropout))
+                    self.long_decoder_layers.append(layer)
+                
+                self.long_projection = nn.Linear(d_model, d_model)
+      
+            self.use_acc_fore = config['use_acc_fore']
+            if self.use_acc_fore:
+                self.pos_encoder = PositionalEncoding(d_model)
+           
+                self.acc_encoder_layers = nn.ModuleList([])
+                for _ in range(num_layers):
+                    if config['use_self_attn']:
+                        self.acc_encoder_layers.append(SelfAttentionLayer(d_model, n_heads, dropout))
+                    else:
+                        self.acc_encoder_layers.append(AutoCorrelationLayer(d_model, n_heads, dropout))
+                
+                if config['use_lstm']:
+                    self.lstm_encoder = nn.LSTM(d_model, hidden_size, batch_first=True, bidirectional=True)
+                    self.fc_encoder = nn.Linear(hidden_size * 2, d_model)
+                else:
+                    self.lstm_encoder = None
+                
+                self.acc_decoder_layers = nn.ModuleList([])
+                for _ in range(num_layers):
+                    layer = nn.ModuleList([])
+                    if config['use_self_attn']:
+                        layer.append(SelfAttentionLayer(d_model, n_heads, dropout))
+                        layer.append(CrossAttentionLayer(d_model, n_heads, dropout))
+                    else:
+                        layer.append(AutoCorrelationLayer(d_model, n_heads, dropout))
+                        layer.append(CrossAttentionLayer(d_model, n_heads, dropout))
+                    self.acc_decoder_layers.append(layer)
+                
+                if config['use_lstm']:
+                    self.lstm_decoder = nn.LSTM(d_model, hidden_size, batch_first=True)
+                    self.acc_projection = nn.Linear(hidden_size, d_model)
+                else:
+                    self.lstm_decoder = None
+                    self.acc_projection = nn.Linear(d_model, d_model)
+            
+      
+            self.use_ensemble = config['use_ensemble'] and self.use_long_fore and self.use_acc_fore
+            if self.use_ensemble:
+                self.weight_long = nn.Parameter(torch.ones(1))
+                self.weight_acc = nn.Parameter(torch.ones(1))
+            
+
+            self.final_projection = nn.Linear(d_model, output_size)
+        
+        def forward(self, x_enc, x_dec):
+        
+            x_enc_emb = self.input_embedding(x_enc)
+            x_dec_emb = self.input_embedding(x_dec)
+            
+            
+            if self.use_long_fore:
+               
+                long_enc_out = x_enc_emb
+                if self.decomp is not None:
+                    trend_enc, seasonal_enc = self.decomp(long_enc_out)
+                    long_enc_out = seasonal_enc
+                else:
+                    trend_enc = None
+                
+                for layer in self.long_encoder_layers:
+                    long_enc_out = layer(long_enc_out)
+                
+                if self.decomp is not None:
+                    long_enc_out = long_enc_out + trend_enc
+                
+             
+                long_dec_out = x_dec_emb
+                if self.decomp is not None:
+                    trend_dec, seasonal_dec = self.decomp(long_dec_out)
+                    long_dec_out = seasonal_dec
+                else:
+                    trend_dec = None
+                
+                for self_attn, cross_attn in self.long_decoder_layers:
+                    long_dec_out = self_attn(long_dec_out)
+                    long_dec_out = cross_attn(long_dec_out, long_enc_out, long_enc_out)
+                
+                if self.decomp is not None:
+                    long_dec_out = long_dec_out + trend_dec
+                
+                long_out = self.long_projection(long_dec_out)
+            else:
+                long_out = None
+            
+            
+            if self.use_acc_fore:
+               
+                acc_enc_out = self.pos_encoder(x_enc_emb)
+                acc_dec_out = self.pos_encoder(x_dec_emb)
+                
+                # Encoder
+                for layer in self.acc_encoder_layers:
+                    acc_enc_out = layer(acc_enc_out)
+                
+                if self.lstm_encoder is not None:
+                    lstm_out, (hidden, _) = self.lstm_encoder(acc_enc_out)
+                    hidden = torch.cat([hidden[0], hidden[1]], dim=-1)
+                    hidden = hidden.unsqueeze(1).repeat(1, acc_enc_out.size(1), 1)
+                    acc_enc_out = acc_enc_out + self.fc_encoder(hidden)
+                
+                # Decoder
+                for self_attn, cross_attn in self.acc_decoder_layers:
+                    acc_dec_out = self_attn(acc_dec_out)
+                    acc_dec_out = cross_attn(acc_dec_out, acc_enc_out, acc_enc_out)
+                
+                if self.lstm_decoder is not None:
+                    acc_dec_out, _ = self.lstm_decoder(acc_dec_out)
+                
+                acc_out = self.acc_projection(acc_dec_out)
+            else:
+                acc_out = None
+            
+          
+            
+            if self.use_ensemble:
+                
+                weights = F.softmax(torch.stack([self.weight_long, self.weight_acc]), dim=0)
+                final_out = weights[0] * long_out + weights[1] * acc_out
+            elif self.use_long_fore:
+                final_out = long_out
+            elif self.use_acc_fore:
+                final_out = acc_out
+            else:
+                raise ValueError("At least one forecasting block must be enabled")
+            
+            
+            return self.final_projection(final_out)
+    
+    return AblationModel()
+
+
+def load_crypto_data(file_path):
+    
+    df = pd.read_csv(file_path)
+    
+    
+    column_mapping = {
+        'date': 'date',
+        'open': 'open',
+        'high': 'high',
+        'low': 'low',
+        'close': 'close'
+    }
+    
+    
+    actual_columns = {}
+    for standard_name, possible_names in {
+        'date': ['date', 'calendar_todaydatesort', 'Date'],
+        'open': ['open', 'grid_3x3opensort', 'Open'],
+        'high': ['high', 'grid_3x3highsort', 'High'],
+        'low': ['low', 'grid_3x3lowsort', 'Low'],
+        'close': ['close', 'grid_3x3closesort', 'Close']
+    }.items():
+        for col in possible_names:
+            if col in df.columns:
+                actual_columns[standard_name] = col
+                break
+    
+  
+    df = df[[actual_columns[col] for col in ['date', 'open', 'high', 'low', 'close']]]
+    df.columns = ['date', 'open', 'high', 'low', 'close']
+    
+
+    df['date'] = pd.to_datetime(df['date'])
+    
+
+    df = df.sort_values('date')
+    
+    df = df.reset_index(drop=True)
+    
+    return df
+
+def prepare_features(df):
+
+    df['ma7'] = df['close'].rolling(window=7).mean()
+    df['ma14'] = df['close'].rolling(window=14).mean()
+    df['ma30'] = df['close'].rolling(window=30).mean()
+
+    delta = df['close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
+    
+    rs = avg_gain / avg_loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+    df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = df['ema12'] - df['ema26']
+    df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+    df['macd_hist'] = df['macd'] - df['macd_signal']
+
+    df['bb_middle'] = df['close'].rolling(window=20).mean()
+    df['bb_std'] = df['close'].rolling(window=20).std()
+    df['bb_upper'] = df['bb_middle'] + 2 * df['bb_std']
+    df['bb_lower'] = df['bb_middle'] - 2 * df['bb_std']
+
+    df['price_change'] = df['close'].pct_change()
+
+    df['volatility'] = df['close'].rolling(window=14).std()
+
+    df['hl_range'] = (df['high'] - df['low']) / df['close']
+
+    df = df.dropna()
+    
+    return df
+
+
+
+class TimeSeriesDataset(Dataset):
+    def __init__(self, data, seq_length, pred_length):
+        self.data = data
+        self.seq_length = seq_length
+        self.pred_length = pred_length
+        
+    def __len__(self):
+        return len(self.data) - self.seq_length - self.pred_length + 1
+    
+    def __getitem__(self, idx):
+
+        x = self.data[idx:idx+self.seq_length]
+        y = self.data[idx+self.seq_length:idx+self.seq_length+self.pred_length]
+
+        decoder_input = torch.zeros_like(y)
+        if self.seq_length > 0:
+            decoder_input[0] = x[-1]
+        decoder_input[1:] = y[:-1]
+        
+        return x, decoder_input, y
+    
+    
+class AutoCorrelationLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super(AutoCorrelationLayer, self).__init__()
+        self.autocorr = AutoCorrelation(dim=d_model, heads=n_heads)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+    def forward(self, x, attn_mask=None):
+        x = x + self.dropout(self.autocorr(self.norm1(x), self.norm1(x), self.norm1(x), attn_mask))
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
+    
+class SelfAttentionLayer(nn.Module):
+    def __init__(self, d_model, n_heads, dropout=0.1):
+        super(SelfAttentionLayer, self).__init__()
+        self.attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, d_model * 4),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model * 4, d_model)
+        )
+        
+    def forward(self, x, attn_mask=None):
+        x_norm = self.norm1(x)
+        attn_output, _ = self.attn(x_norm, x_norm, x_norm, attn_mask=attn_mask)
+        x = x + self.dropout(attn_output)
+
+        x = x + self.dropout(self.ff(self.norm2(x)))
+        return x
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, device, epochs=5000):
+
+    train_losses = []
+    val_losses = []
+    
+    for epoch in range(epochs):
+       
+        model.train()
+        train_loss = 0
+        for x_enc, x_dec, y in train_loader:
+            x_enc, x_dec, y = x_enc.to(device), x_dec.to(device), y.to(device)
+            
+            
+            target_col_idx = 3  # Change this to match your target column index
+            y_target = y[:, :, target_col_idx:target_col_idx+1]
+            
+            optimizer.zero_grad()
+
+            output = model(x_enc, x_dec)
+
+            loss = criterion(output, y_target)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+                
+        train_loss /= len(train_loader)
+        train_losses.append(train_loss)
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for x_enc, x_dec, y in val_loader:
+                x_enc, x_dec, y = x_enc.to(device), x_dec.to(device), y.to(device)
+                
+                target_col_idx = 3  # Change this to match your target column index
+                y_target = y[:, :, target_col_idx:target_col_idx+1]
+                output = model(x_enc, x_dec)
+                loss = criterion(output, y_target)
+                
+                val_loss += loss.item()
+        
+        val_loss /= len(val_loader)
+        val_losses.append(val_loss)
+        
+        scheduler.step(val_loss)
+        
+        # Print progress
+        # if (epoch + 1) % 1 == 0:
+        #     print(f'Epoch {epoch+1}/{epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
+    
+    return train_losses, val_losses
+
+# def evaluate_model(model, test_loader, criterion, device, scaler, target_col_idx=3):
+#     """
+#     Evaluate the model
+#     """
+#     model.eval()
+#     test_loss = 0
+#     predictions = []
+#     actuals = []
+    
+#     with torch.no_grad():
+#         for x_enc, x_dec, y in test_loader:
+#             x_enc, x_dec, y = x_enc.to(device), x_dec.to(device), y.to(device)
+            
+#             # Extract only the target column from y
+#             y_target = y[:, :, target_col_idx:target_col_idx+1]
+            
+#             # Forward pass
+#             output = model(x_enc, x_dec)
+            
+#             # Calculate loss using only the target column
+#             loss = criterion(output, y_target)
+            
+#             test_loss += loss.item()
+            
+#             # Store predictions and actuals
+#             pred = output.cpu().numpy()
+#             actual = y_target.cpu().numpy()  # Use y_target instead of y
+            
+#             predictions.append(pred)
+#             actuals.append(actual)
+    
+#     # ... rest of the function ...
+    
+#     test_loss /= len(test_loader)
+#     print(predictions)
+#     # Concatenate predictions and actuals
+#     predictions = np.concatenate(predictions, axis=0)
+#     actuals = np.concatenate(actuals, axis=0)
+#     print(len(predictions))
+#     print(predictions)
+#     # Extract only the target column (close price) for evaluation
+#     if len(predictions.shape) == 3:
+#         # If predictions have shape [batch, seq_len, features]
+#         # Extract only the close price feature (typically index 3 or target_col_idx)
+#         if predictions.shape[2] != 1:
+#             # If model predicts multiple features
+#             predictions_close = predictions[:, :, target_col_idx:target_col_idx+1]
+#         else:
+#             # If model already predicts only one feature
+#             predictions_close = predictions
+            
+#         if actuals.shape[2] != 1:
+#             # If actuals have multiple features
+#             actuals_close = actuals[:, :, target_col_idx:target_col_idx+1]
+#         else:
+#             # If actuals already have only one feature
+#             actuals_close = actuals
+            
+#         # Reshape to 2D for metric calculation
+#         predictions_2d = predictions_close.reshape(-1, 1)
+#         actuals_2d = actuals_close.reshape(-1, 1)
+#     else:
+#         # If already 2D
+#         predictions_2d = predictions
+#         actuals_2d = actuals
+#     print(actuals_2d[4],      predictions_2d[4])
+#     # Calculate metrics
+#     mse = mean_squared_error(actuals_2d, predictions_2d)
+#     rmse = np.sqrt(mse)
+#     mae = mean_absolute_error(actuals_2d, predictions_2d)
+#     mae_per_seq = np.mean(np.abs(predictions_close - actuals_close), axis=1)
+#     from sklearn.metrics import r2_score, median_absolute_error, explained_variance_score
+
+#     # Extra metrics
+#     mape = np.mean(np.abs((actuals_2d - predictions_2d) / (actuals_2d + 1e-8))) * 100
+#     smape = 100 * np.mean(2 * np.abs(predictions_2d - actuals_2d) / (np.abs(predictions_2d) + np.abs(actuals_2d) + 1e-8))
+#     r2 = r2_score(actuals_2d, predictions_2d)
+#     medae = median_absolute_error(actuals_2d, predictions_2d)
+#     explained_var = explained_variance_score(actuals_2d, predictions_2d)
+#     mbe = np.mean(predictions_2d - actuals_2d)
+    
+#     # print(f"MAPE: {mape:.2f}%")
+#     # print(f"sMAPE: {smape:.2f}%")
+#     # print(f"R²: {r2:.4f}")
+#     # print(f"Median AE: {medae:.4f}")
+#     # print(f"Explained Variance: {explained_var:.4f}")
+#     # print(f"MBE: {mbe:.4f}")
+
+#     # print("Average sequence MAE:", np.mean(mae_per_seq))
+
+    
+#     return test_loss, mse, rmse, mape, smape, medae, r2, mbe, explained_var, mae, predictions, actuals
+
+
+def evaluate_model(model, test_loader, criterion, device, scaler, target_col_idx=3):
+
+    model.eval()
+    test_loss = 0
+    predictions = []
+    actuals = []
+
+    with torch.no_grad():
+        for x_enc, x_dec, y in test_loader:
+            x_enc, x_dec, y = x_enc.to(device), x_dec.to(device), y.to(device)
+
+            y_target = y[:, :, target_col_idx:target_col_idx+1]
+            output = model(x_enc, x_dec)
+            loss = criterion(output, y_target)
+
+            test_loss += loss.item()
+            pred = output.cpu().numpy()
+            actual = y_target.cpu().numpy()
+
+            predictions.append(pred)
+            actuals.append(actual)
+
+    test_loss /= len(test_loader)
+    predictions = np.concatenate(predictions, axis=0)
+    actuals = np.concatenate(actuals, axis=0)
+    if len(predictions.shape) == 3:
+        predictions_2d = predictions.reshape(-1, predictions.shape[2])
+        actuals_2d = actuals.reshape(-1, actuals.shape[2])
+    else:
+        predictions_2d = predictions
+        actuals_2d = actuals
+    predictions_2d_real = scaler.inverse_transform(predictions_2d)
+    actuals_2d_real = scaler.inverse_transform(actuals_2d)
+    mse = mean_squared_error(actuals_2d_real, predictions_2d_real)
+    rmse = np.sqrt(mse)
+    mae = mean_absolute_error(actuals_2d_real, predictions_2d_real)
+
+    from sklearn.metrics import r2_score, median_absolute_error, explained_variance_score
+
+    mape = np.mean(np.abs((actuals_2d_real - predictions_2d_real) / (actuals_2d_real + 1e-8))) * 100
+    smape = 100 * np.mean(2 * np.abs(predictions_2d_real - actuals_2d_real) / (np.abs(predictions_2d_real) + np.abs(actuals_2d_real) + 1e-8))
+    r2 = r2_score(actuals_2d_real, predictions_2d_real)
+    medae = median_absolute_error(actuals_2d_real, predictions_2d_real)
+    explained_var = explained_variance_score(actuals_2d_real, predictions_2d_real)
+    mbe = np.mean(predictions_2d_real - actuals_2d_real)
+
+    return test_loss, mse, rmse, mape, smape, medae, r2, mbe, explained_var, mae, predictions_2d_real, actuals_2d_real
+
+
+
+
+
+
+
+   
+def process_multiple_cryptos(crypto_files, seq_length, pred_length, target_col='close', device='cuda'):
+    results = {}
+    
+    for crypto_file in crypto_files:
+        # print(f"\n{'='*50}")
+        # print(f"Processing {crypto_file}")
+        # print(f"{'='*50}")
+        
+        df = load_crypto_data(crypto_file)
+        # print(f"Loaded data with {len(df)} rows")
+        
+        df = prepare_features(df)
+        # print(f"Prepared features, data shape: {df.shape}")
+        
+        crypto_results = run(
+            data=df,
+            seq_length=seq_length,
+            pred_length=pred_length,
+            target_col=target_col,
+            device=device,
+            epochs=5000
+        )
+        
+        crypto_name = os.path.splitext(os.path.basename(crypto_file))[0]
+        results[crypto_name] = crypto_results
+        save_results(crypto_name, crypto_results)
+    compare_crypto_results(results)
+    
+    return results
+def plot_predictions(predictions, actuals, crypto_name, config_name):
+
+    plt.figure(figsize=(12, 6))
+
+    pred_seq = predictions[0, :, 0]  # First batch, all time steps, close price
+    actual_seq = actuals[0, :, 0]    # First batch, all time steps, close price
+    
+    plt.plot(actual_seq, label='Actual')
+    plt.plot(pred_seq, label='Predicted')
+    plt.title(f'{crypto_name} - {config_name} Predictions')
+    plt.xlabel('Time Steps')
+    plt.ylabel('Price (Normalized)')
+    plt.legend()
+    
+    plt.savefig(f'results/{crypto_name}/{config_name}_prediction_plot.png')
+    plt.close()
+def save_results(crypto_name, results):
+    os.makedirs('results', exist_ok=True)
+    os.makedirs(f'results/{crypto_name}', exist_ok=True)
+    metrics = {
+        'Configuration': [],
+        'MSE': [],
+        'RMSE': [],
+        'MAE': [],
+        'MAPE (%)': [],
+
+    }
+
+    
+    for config_name, result in results.items():
+        metrics['Configuration'].append(config_name)
+        metrics['MSE'].append(result['mse'])
+        metrics['RMSE'].append(result['rmse'])
+        metrics['MAE'].append(result['mae'])
+        metrics['MAPE (%)'].append(result['mape'])
+
+
+    
+    metrics_df = pd.DataFrame(metrics)
+    metrics_df.to_csv(f'results/{crypto_name}/metrics.csv', index=False)
+    
+    # Save predictions
+    for config_name, result in results.items():
+        predictions = result['predictions']
+        actuals = result['actuals']
+        if len(predictions.shape) == 3:
+
+            pred_flat = predictions[:, :, 0].flatten()
+            actual_flat = actuals[:, :, 0].flatten()
+        else:
+            # If already 2D, just take the first column
+            pred_flat = predictions[:, 0]
+            actual_flat = actuals[:, 0]
+        
+        # Create DataFrame with 1D arrays
+        pred_df = pd.DataFrame({
+            'Actual': actual_flat,
+            'Predicted': pred_flat
+        })
+        
+        pred_df.to_csv(f'results/{crypto_name}/{config_name}_predictions_2.csv', index=False)
+    plt.figure(figsize=(15, 10))  
+    
+    plt.subplot(1, 2, 1)
+    for config_name, result in results.items():
+        plt.plot(result['train_losses'], label=config_name)
+    plt.title(f'{crypto_name} - Training Loss Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    for config_name, result in results.items():
+        plt.plot(result['val_losses'], label=config_name)
+    plt.title(f'{crypto_name} - Validation Loss Curves')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(f'results/{crypto_name}/training_curves.png')
+    plt.close()
+def visualize_ablation_results(results):
+    os.makedirs('results/visualizations', exist_ok=True)
+    configs = list(results.keys())
+    mse_values = [results[config]['mse'] for config in configs]
+    rmse_values = [results[config]['rmse'] for config in configs]
+    mae_values = [results[config]['mae'] for config in configs]
+
+    plt.figure(figsize=(15, 10))
+
+    plt.subplot(1, 3, 1)
+    plt.bar(configs, mse_values)
+    plt.title('Mean Squared Error (MSE)')
+    plt.xlabel('Configuration')
+    plt.ylabel('MSE')
+    plt.xticks(rotation=45, ha='right')
+    plt.subplot(1, 3, 2)
+    plt.bar(configs, rmse_values)
+    plt.title('Root Mean Squared Error (RMSE)')
+    plt.xlabel('Configuration')
+    plt.ylabel('RMSE')
+    plt.xticks(rotation=45, ha='right')
+    plt.subplot(1, 3, 3)
+    plt.bar(configs, mae_values)
+    plt.title('Mean Absolute Error (MAE)')
+    plt.xlabel('Configuration')
+    plt.ylabel('MAE')
+    plt.xticks(rotation=45, ha='right')
+    
+    plt.tight_layout()
+    plt.savefig('results/visualizations/ablation_metrics.png')
+    plt.close()
+    plt.figure(figsize=(15, 5))
+    
+
+    for config in configs:
+        plt.figure(figsize=(12, 6))
+        
+        
+        predictions = results[config]['predictions']
+        actuals = results[config]['actuals']
+        
+        
+        if len(predictions.shape) == 3:
+            pred_seq = predictions[0, :, 0]  # First batch, all time steps, first feature
+            actual_seq = actuals[0, :, 0]    # First batch, all time steps, first feature
+        else:
+            pred_seq = predictions[:30, 0]    # First 30 samples, first feature
+            actual_seq = actuals[:30, 0]      # First 30 samples, first feature
+        
+        plt.plot(actual_seq, label='Actual')
+        plt.plot(pred_seq, label='Predicted')
+        plt.title(f'{config} Predictions')
+        plt.xlabel('Time Steps')
+        plt.ylabel('Price (Normalized)')
+        plt.legend()
+        
+        plt.savefig(f'results/visualizations/{config}_prediction.png')
+        plt.close()
+    
+    print(f"Visualizations saved to 'results/visualizations/'")
+def compare_crypto_results(results):
+    os.makedirs('results/comparison', exist_ok=True)
+
+    best_models = {}
+    for crypto_name, crypto_results in results.items():
+        best_config = min(crypto_results.items(), key=lambda x: x[1]['rmse'])
+        best_models[crypto_name] = {
+            'config': best_config[0],
+            'rmse': best_config[1]['rmse'],
+            'mse': best_config[1]['mse'],
+            'mae': best_config[1]['mae']
+        }
+    
+    comparison_df = pd.DataFrame({
+        'Cryptocurrency': list(best_models.keys()),
+        'Best Configuration': [model['config'] for model in best_models.values()],
+        'RMSE': [model['rmse'] for model in best_models.values()],
+        'MSE': [model['mse'] for model in best_models.values()],
+        'MAE': [model['mae'] for model in best_models.values()]
+    })
+    
+    comparison_df.to_csv('results/comparison/best_models.csv', index=False)
+  
+    plt.figure(figsize=(15, 10))
+    
+    plt.subplot(1, 3, 1)
+    plt.bar(comparison_df['Cryptocurrency'], comparison_df['RMSE'])
+    plt.title('RMSE Comparison')
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel('RMSE')
+    
+    plt.subplot(1, 3, 2)
+    plt.bar(comparison_df['Cryptocurrency'], comparison_df['MSE'])
+    plt.title('MSE Comparison')
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel('MSE')
+    
+    plt.subplot(1, 3, 3)
+    plt.bar(comparison_df['Cryptocurrency'], comparison_df['MAE'])
+    plt.title('MAE Comparison')
+    plt.xticks(rotation=45, ha='right')
+    plt.ylabel('MAE')
+    
+    plt.tight_layout()
+    plt.savefig('results/comparison/metrics_comparison.png')
+    plt.close()
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+
+    seq_length = 60  # Historical window
+    pred_length = 30  # Prediction horizon
+    target_col = 'close'  # Target column for prediction
+    crypto_files = [f for f in os.listdir() if f.endswith('.csv')]
+    
+    if not crypto_files:
+        print("No CSV files found in the current directory.")
+        return
+    
+    print(f"Found {len(crypto_files)} cryptocurrency files: {crypto_files}")
+ 
+    results = process_multiple_cryptos(
+        crypto_files=crypto_files,
+        seq_length=seq_length,
+        pred_length=pred_length,
+        target_col=target_col,
+        device=device
+    )
+    
+    print("\nAnalysis completed successfully!")
+    print(f"Results saved in the 'results' directory.")
+
+if __name__ == "__main__":
+    main()
+
